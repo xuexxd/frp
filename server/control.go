@@ -23,13 +23,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fatedier/frp/models/auth"
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/consts"
 	frpErr "github.com/fatedier/frp/models/errors"
 	"github.com/fatedier/frp/models/msg"
+	plugin "github.com/fatedier/frp/models/plugin/server"
 	"github.com/fatedier/frp/server/controller"
+	"github.com/fatedier/frp/server/metrics"
 	"github.com/fatedier/frp/server/proxy"
-	"github.com/fatedier/frp/server/stats"
+	"github.com/fatedier/frp/utils/util"
 	"github.com/fatedier/frp/utils/version"
 	"github.com/fatedier/frp/utils/xlog"
 
@@ -86,8 +89,11 @@ type Control struct {
 	// proxy manager
 	pxyManager *proxy.ProxyManager
 
-	// stats collector to store stats info of clients and proxies
-	statsCollector stats.Collector
+	// plugin manager
+	pluginManager *plugin.Manager
+
+	// verifies authentication based on selected method
+	authVerifier auth.Verifier
 
 	// login message
 	loginMsg *msg.Login
@@ -138,9 +144,16 @@ type Control struct {
 	ctx context.Context
 }
 
-func NewControl(ctx context.Context, rc *controller.ResourceController, pxyManager *proxy.ProxyManager,
-	statsCollector stats.Collector, ctlConn net.Conn, loginMsg *msg.Login,
-	serverCfg config.ServerCommonConf) *Control {
+func NewControl(
+	ctx context.Context,
+	rc *controller.ResourceController,
+	pxyManager *proxy.ProxyManager,
+	pluginManager *plugin.Manager,
+	authVerifier auth.Verifier,
+	ctlConn net.Conn,
+	loginMsg *msg.Login,
+	serverCfg config.ServerCommonConf,
+) *Control {
 
 	poolCount := loginMsg.PoolCount
 	if poolCount > int(serverCfg.MaxPoolCount) {
@@ -149,7 +162,8 @@ func NewControl(ctx context.Context, rc *controller.ResourceController, pxyManag
 	return &Control{
 		rc:              rc,
 		pxyManager:      pxyManager,
-		statsCollector:  statsCollector,
+		pluginManager:   pluginManager,
+		authVerifier:    authVerifier,
 		conn:            ctlConn,
 		loginMsg:        loginMsg,
 		sendCh:          make(chan msg.Message, 10),
@@ -191,7 +205,7 @@ func (ctl *Control) Start() {
 	go ctl.stoper()
 }
 
-func (ctl *Control) RegisterWorkConn(conn net.Conn) {
+func (ctl *Control) RegisterWorkConn(conn net.Conn) error {
 	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
@@ -203,9 +217,10 @@ func (ctl *Control) RegisterWorkConn(conn net.Conn) {
 	select {
 	case ctl.workConnCh <- conn:
 		xl.Debug("new work connection registered")
+		return nil
 	default:
 		xl.Debug("work connection pool is full, discarding")
-		conn.Close()
+		return fmt.Errorf("work connection pool is full, discarding")
 	}
 }
 
@@ -361,16 +376,12 @@ func (ctl *Control) stoper() {
 	for _, pxy := range ctl.proxies {
 		pxy.Close()
 		ctl.pxyManager.Del(pxy.GetName())
-		ctl.statsCollector.Mark(stats.TypeCloseProxy, &stats.CloseProxyPayload{
-			Name:      pxy.GetName(),
-			ProxyType: pxy.GetConf().GetBaseInfo().ProxyType,
-		})
+		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
 	}
 
 	ctl.allShutdown.Done()
 	xl.Info("client exit success")
-
-	ctl.statsCollector.Mark(stats.TypeCloseClient, &stats.CloseClientPayload{})
+	metrics.Server.CloseClient()
 }
 
 // block until Control closed
@@ -407,27 +418,58 @@ func (ctl *Control) manager() {
 
 			switch m := rawMsg.(type) {
 			case *msg.NewProxy:
+				content := &plugin.NewProxyContent{
+					User: plugin.UserInfo{
+						User:  ctl.loginMsg.User,
+						Metas: ctl.loginMsg.Metas,
+						RunId: ctl.loginMsg.RunId,
+					},
+					NewProxy: *m,
+				}
+				var remoteAddr string
+				retContent, err := ctl.pluginManager.NewProxy(content)
+				if err == nil {
+					m = &retContent.NewProxy
+					remoteAddr, err = ctl.RegisterProxy(m)
+				}
+
 				// register proxy in this control
-				remoteAddr, err := ctl.RegisterProxy(m)
 				resp := &msg.NewProxyResp{
 					ProxyName: m.ProxyName,
 				}
 				if err != nil {
-					resp.Error = err.Error()
 					xl.Warn("new proxy [%s] error: %v", m.ProxyName, err)
+					resp.Error = util.GenerateResponseErrorString(fmt.Sprintf("new proxy [%s] error", m.ProxyName), err, ctl.serverCfg.DetailedErrorsToClient)
 				} else {
 					resp.RemoteAddr = remoteAddr
 					xl.Info("new proxy [%s] success", m.ProxyName)
-					ctl.statsCollector.Mark(stats.TypeNewProxy, &stats.NewProxyPayload{
-						Name:      m.ProxyName,
-						ProxyType: m.ProxyType,
-					})
+					metrics.Server.NewProxy(m.ProxyName, m.ProxyType)
 				}
 				ctl.sendCh <- resp
 			case *msg.CloseProxy:
 				ctl.CloseProxy(m)
 				xl.Info("close proxy [%s] success", m.ProxyName)
 			case *msg.Ping:
+				content := &plugin.PingContent{
+					User: plugin.UserInfo{
+						User:  ctl.loginMsg.User,
+						Metas: ctl.loginMsg.Metas,
+						RunId: ctl.loginMsg.RunId,
+					},
+					Ping: *m,
+				}
+				retContent, err := ctl.pluginManager.Ping(content)
+				if err == nil {
+					m = &retContent.Ping
+					err = ctl.authVerifier.VerifyPing(m)
+				}
+				if err != nil {
+					xl.Warn("received invalid ping: %v", err)
+					ctl.sendCh <- &msg.Pong{
+						Error: util.GenerateResponseErrorString("invalid ping", err, ctl.serverCfg.DetailedErrorsToClient),
+					}
+					return
+				}
 				ctl.lastPing = time.Now()
 				xl.Debug("receive heartbeat")
 				ctl.sendCh <- &msg.Pong{}
@@ -444,9 +486,16 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 		return
 	}
 
+	// User info
+	userInfo := plugin.UserInfo{
+		User:  ctl.loginMsg.User,
+		Metas: ctl.loginMsg.Metas,
+		RunId: ctl.runId,
+	}
+
 	// NewProxy will return a interface Proxy.
 	// In fact it create different proxies by different proxy type, we just call run() here.
-	pxy, err := proxy.NewProxy(ctl.ctx, ctl.runId, ctl.rc, ctl.statsCollector, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg)
+	pxy, err := proxy.NewProxy(ctl.ctx, userInfo, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg)
 	if err != nil {
 		return remoteAddr, err
 	}
@@ -508,9 +557,6 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	ctl.statsCollector.Mark(stats.TypeCloseProxy, &stats.CloseProxyPayload{
-		Name:      pxy.GetName(),
-		ProxyType: pxy.GetConf().GetBaseInfo().ProxyType,
-	})
+	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
 	return
 }

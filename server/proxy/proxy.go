@@ -24,8 +24,9 @@ import (
 
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/msg"
+	plugin "github.com/fatedier/frp/models/plugin/server"
 	"github.com/fatedier/frp/server/controller"
-	"github.com/fatedier/frp/server/stats"
+	"github.com/fatedier/frp/server/metrics"
 	frpNet "github.com/fatedier/frp/utils/net"
 	"github.com/fatedier/frp/utils/xlog"
 
@@ -41,18 +42,20 @@ type Proxy interface {
 	GetConf() config.ProxyConf
 	GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn, err error)
 	GetUsedPortsNum() int
+	GetResourceController() *controller.ResourceController
+	GetUserInfo() plugin.UserInfo
 	Close()
 }
 
 type BaseProxy struct {
-	name           string
-	rc             *controller.ResourceController
-	statsCollector stats.Collector
-	listeners      []net.Listener
-	usedPortsNum   int
-	poolCount      int
-	getWorkConnFn  GetWorkConnFn
-	serverCfg      config.ServerCommonConf
+	name          string
+	rc            *controller.ResourceController
+	listeners     []net.Listener
+	usedPortsNum  int
+	poolCount     int
+	getWorkConnFn GetWorkConnFn
+	serverCfg     config.ServerCommonConf
+	userInfo      plugin.UserInfo
 
 	mu  sync.RWMutex
 	xl  *xlog.Logger
@@ -69,6 +72,14 @@ func (pxy *BaseProxy) Context() context.Context {
 
 func (pxy *BaseProxy) GetUsedPortsNum() int {
 	return pxy.usedPortsNum
+}
+
+func (pxy *BaseProxy) GetResourceController() *controller.ResourceController {
+	return pxy.rc
+}
+
+func (pxy *BaseProxy) GetUserInfo() plugin.UserInfo {
+	return pxy.userInfo
 }
 
 func (pxy *BaseProxy) Close() {
@@ -116,6 +127,7 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 			SrcPort:   uint16(srcPort),
 			DstAddr:   dstAddr,
 			DstPort:   uint16(dstPort),
+			Error:     "",
 		})
 		if err != nil {
 			xl.Warn("failed to send message to work connection from pool: %v, times: %d", err, i)
@@ -135,7 +147,7 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 // startListenHandler start a goroutine handler for each listener.
 // p: p will just be passed to handler(Proxy, frpNet.Conn).
 // handler: each proxy type can set different handler function to deal with connections accepted from listeners.
-func (pxy *BaseProxy) startListenHandler(p Proxy, handler func(Proxy, net.Conn, stats.Collector, config.ServerCommonConf)) {
+func (pxy *BaseProxy) startListenHandler(p Proxy, handler func(Proxy, net.Conn, config.ServerCommonConf)) {
 	xl := xlog.FromContextSafe(pxy.ctx)
 	for _, listener := range pxy.listeners {
 		go func(l net.Listener) {
@@ -148,31 +160,36 @@ func (pxy *BaseProxy) startListenHandler(p Proxy, handler func(Proxy, net.Conn, 
 					return
 				}
 				xl.Debug("get a user connection [%s]", c.RemoteAddr().String())
-				go handler(p, c, pxy.statsCollector, pxy.serverCfg)
+				go handler(p, c, pxy.serverCfg)
 			}
 		}(listener)
 	}
 }
 
-func NewProxy(ctx context.Context, runId string, rc *controller.ResourceController, statsCollector stats.Collector, poolCount int,
+func NewProxy(ctx context.Context, userInfo plugin.UserInfo, rc *controller.ResourceController, poolCount int,
 	getWorkConnFn GetWorkConnFn, pxyConf config.ProxyConf, serverCfg config.ServerCommonConf) (pxy Proxy, err error) {
 
 	xl := xlog.FromContextSafe(ctx).Spawn().AppendPrefix(pxyConf.GetBaseInfo().ProxyName)
 	basePxy := BaseProxy{
-		name:           pxyConf.GetBaseInfo().ProxyName,
-		rc:             rc,
-		statsCollector: statsCollector,
-		listeners:      make([]net.Listener, 0),
-		poolCount:      poolCount,
-		getWorkConnFn:  getWorkConnFn,
-		serverCfg:      serverCfg,
-		xl:             xl,
-		ctx:            xlog.NewContext(ctx, xl),
+		name:          pxyConf.GetBaseInfo().ProxyName,
+		rc:            rc,
+		listeners:     make([]net.Listener, 0),
+		poolCount:     poolCount,
+		getWorkConnFn: getWorkConnFn,
+		serverCfg:     serverCfg,
+		xl:            xl,
+		ctx:           xlog.NewContext(ctx, xl),
+		userInfo:      userInfo,
 	}
 	switch cfg := pxyConf.(type) {
 	case *config.TcpProxyConf:
 		basePxy.usedPortsNum = 1
 		pxy = &TcpProxy{
+			BaseProxy: &basePxy,
+			cfg:       cfg,
+		}
+	case *config.TcpMuxProxyConf:
+		pxy = &TcpMuxProxy{
 			BaseProxy: &basePxy,
 			cfg:       cfg,
 		}
@@ -202,6 +219,11 @@ func NewProxy(ctx context.Context, runId string, rc *controller.ResourceControll
 			BaseProxy: &basePxy,
 			cfg:       cfg,
 		}
+	case *config.SudpProxyConf:
+		pxy = &SudpProxy{
+			BaseProxy: &basePxy,
+			cfg:       cfg,
+		}
 	default:
 		return pxy, fmt.Errorf("proxy type not support")
 	}
@@ -210,9 +232,23 @@ func NewProxy(ctx context.Context, runId string, rc *controller.ResourceControll
 
 // HandleUserTcpConnection is used for incoming tcp user connections.
 // It can be used for tcp, http, https type.
-func HandleUserTcpConnection(pxy Proxy, userConn net.Conn, statsCollector stats.Collector, serverCfg config.ServerCommonConf) {
+func HandleUserTcpConnection(pxy Proxy, userConn net.Conn, serverCfg config.ServerCommonConf) {
 	xl := xlog.FromContextSafe(pxy.Context())
 	defer userConn.Close()
+
+	// server plugin hook
+	rc := pxy.GetResourceController()
+	content := &plugin.NewUserConnContent{
+		User:       pxy.GetUserInfo(),
+		ProxyName:  pxy.GetName(),
+		ProxyType:  pxy.GetConf().GetBaseInfo().ProxyType,
+		RemoteAddr: userConn.RemoteAddr().String(),
+	}
+	_, err := rc.PluginManager.NewUserConn(content)
+	if err != nil {
+		xl.Warn("the user conn [%s] was rejected, err:%v", content.RemoteAddr, err)
+		return
+	}
 
 	// try all connections from the pool
 	workConn, err := pxy.GetWorkConnFromPool(userConn.RemoteAddr(), userConn.LocalAddr())
@@ -237,17 +273,13 @@ func HandleUserTcpConnection(pxy Proxy, userConn net.Conn, statsCollector stats.
 	xl.Debug("join connections, workConn(l[%s] r[%s]) userConn(l[%s] r[%s])", workConn.LocalAddr().String(),
 		workConn.RemoteAddr().String(), userConn.LocalAddr().String(), userConn.RemoteAddr().String())
 
-	statsCollector.Mark(stats.TypeOpenConnection, &stats.OpenConnectionPayload{ProxyName: pxy.GetName()})
+	name := pxy.GetName()
+	proxyType := pxy.GetConf().GetBaseInfo().ProxyType
+	metrics.Server.OpenConnection(name, proxyType)
 	inCount, outCount := frpIo.Join(local, userConn)
-	statsCollector.Mark(stats.TypeCloseConnection, &stats.CloseConnectionPayload{ProxyName: pxy.GetName()})
-	statsCollector.Mark(stats.TypeAddTrafficIn, &stats.AddTrafficInPayload{
-		ProxyName:    pxy.GetName(),
-		TrafficBytes: inCount,
-	})
-	statsCollector.Mark(stats.TypeAddTrafficOut, &stats.AddTrafficOutPayload{
-		ProxyName:    pxy.GetName(),
-		TrafficBytes: outCount,
-	})
+	metrics.Server.CloseConnection(name, proxyType)
+	metrics.Server.AddTrafficIn(name, proxyType, inCount)
+	metrics.Server.AddTrafficOut(name, proxyType, outCount)
 	xl.Debug("join connections closed")
 }
 

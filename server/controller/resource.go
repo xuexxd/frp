@@ -16,8 +16,10 @@ package controller
 
 import (
 	"github.com/fatedier/frp/models/nathole"
+	plugin "github.com/fatedier/frp/models/plugin/server"
 	"github.com/fatedier/frp/server/group"
 	"github.com/fatedier/frp/server/ports"
+	"github.com/fatedier/frp/utils/tcpmux"
 	"github.com/fatedier/frp/utils/vhost"
 )
 
@@ -31,6 +33,9 @@ type ResourceController struct {
 
 	// HTTP Group Controller
 	HTTPGroupCtl *group.HTTPGroupController
+
+	// TCP Mux Group Controller
+	TcpMuxGroupCtl *group.TcpMuxGroupCtl
 
 	// Manage all tcp ports
 	TcpPortManager *ports.PortManager
@@ -46,4 +51,10 @@ type ResourceController struct {
 
 	// Controller for nat hole connections
 	NatHoleController *nathole.NatHoleController
+
+	// TcpMux HTTP CONNECT multiplexer
+	TcpMuxHttpConnectMuxer *tcpmux.HttpConnectTcpMuxer
+
+	// All server manager plugin
+	PluginManager *plugin.Manager
 }
